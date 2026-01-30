@@ -13,7 +13,8 @@ VAPI_API_URL = "https://api.vapi.ai"
 
 # Bridge Server Configuration
 BRIDGE_HOST = os.getenv("BRIDGE_HOST", "0.0.0.0")
-BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8080"))
+# Railway provides PORT env variable automatically
+BRIDGE_PORT = int(os.getenv("PORT", os.getenv("BRIDGE_PORT", "8080")))
 
 # n8n Webhook (optional - for sending call results)
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
