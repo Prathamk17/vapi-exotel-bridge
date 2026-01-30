@@ -78,6 +78,7 @@ class ExotelVAPIBridge:
         Exotel sends: JSON messages with base64-encoded audio
         VAPI expects: Raw binary PCM audio
         """
+        media_count = 0
         try:
             async for message in exotel_ws:
                 if not vapi_ws.open:
@@ -90,7 +91,13 @@ class ExotelVAPIBridge:
                         msg_data = json.loads(message)
                         event_type = msg_data.get("event")
 
+                        # Enhanced logging: Log ALL message structures
+                        logger.info(f"📥 Exotel message: event={event_type}, keys={list(msg_data.keys())}")
+
                         if event_type == "media":
+                            # Log full media structure for debugging
+                            logger.info(f"🎵 Media event structure: {json.dumps(msg_data, indent=2)[:500]}")
+
                             # Extract and decode audio payload
                             media_payload = msg_data.get("media", {}).get("payload")
                             if media_payload:
@@ -98,23 +105,36 @@ class ExotelVAPIBridge:
                                 audio_data = base64.b64decode(media_payload)
                                 # Send raw binary to VAPI
                                 await vapi_ws.send(audio_data)
-                                logger.debug(f"Forwarded {len(audio_data)} bytes audio to VAPI")
-                        elif event_type in ["connected", "start"]:
-                            logger.info(f"Exotel control: {event_type}")
+                                media_count += 1
+                                logger.info(f"✅ Forwarded {len(audio_data)} bytes audio to VAPI (chunk #{media_count})")
+                            else:
+                                logger.warning(f"⚠️  Media event has no payload! Full message: {msg_data}")
+                        elif event_type == "connected":
+                            logger.info(f"Exotel control: connected - {msg_data}")
+                        elif event_type == "start":
+                            logger.info(f"Exotel control: start - {msg_data}")
+                            # Send acknowledgment to Exotel to start media streaming
+                            ack_message = {
+                                "event": "start",
+                                "stream_sid": msg_data.get("stream_sid", "default"),
+                                "media_format": msg_data.get("media_format", {})
+                            }
+                            await exotel_ws.send(json.dumps(ack_message))
+                            logger.info(f"📤 Sent start acknowledgment to Exotel")
                         elif event_type == "stop":
-                            logger.info("Exotel stream stopped")
+                            logger.info(f"Exotel stream stopped. Total media chunks received: {media_count}")
                             break
                         else:
-                            logger.debug(f"Exotel event: {event_type}")
+                            logger.info(f"Exotel event: {event_type} - {msg_data}")
                     except json.JSONDecodeError:
                         logger.warning(f"Non-JSON message from Exotel: {message[:100]}")
                     except Exception as e:
-                        logger.error(f"Error processing Exotel message: {e}")
+                        logger.error(f"Error processing Exotel message: {e}", exc_info=True)
                 else:
-                    logger.warning(f"Unexpected binary message from Exotel")
+                    logger.warning(f"Unexpected binary message from Exotel (length: {len(message)})")
 
         except websockets.exceptions.ConnectionClosed:
-            logger.info("Exotel WebSocket connection closed")
+            logger.info(f"Exotel WebSocket connection closed. Total media chunks: {media_count}")
         except Exception as e:
             logger.error(f"Error in exotel_to_vapi forward: {e}", exc_info=True)
 
@@ -125,6 +145,7 @@ class ExotelVAPIBridge:
         Exotel expects: JSON messages with base64-encoded audio
         """
         sequence_number = 1
+        audio_count = 0
         try:
             async for message in vapi_ws:
                 if not exotel_ws.open:
@@ -146,20 +167,21 @@ class ExotelVAPIBridge:
                         }
                     }
                     await exotel_ws.send(json.dumps(exotel_message))
-                    logger.debug(f"Forwarded {len(message)} bytes audio to Exotel")
+                    audio_count += 1
+                    logger.info(f"🔊 Forwarded {len(message)} bytes audio to Exotel (chunk #{audio_count})")
                     sequence_number += 1
 
                 # VAPI also sends text control messages
                 elif isinstance(message, str):
                     try:
                         msg_data = json.loads(message)
-                        logger.info(f"VAPI control message: {msg_data}")
+                        logger.info(f"📨 VAPI control message: {msg_data}")
                         # Could translate VAPI control messages to Exotel format if needed
                     except json.JSONDecodeError:
                         logger.warning(f"Non-JSON text from VAPI: {message[:100]}")
 
         except websockets.exceptions.ConnectionClosed:
-            logger.info("VAPI WebSocket connection closed")
+            logger.info(f"VAPI WebSocket connection closed. Total audio chunks sent: {audio_count}")
         except Exception as e:
             logger.error(f"Error in vapi_to_exotel forward: {e}", exc_info=True)
 
