@@ -9,6 +9,7 @@ import logging
 import websockets
 import aiohttp
 import base64
+import audioop
 from typing import Optional
 from config import VAPI_API_KEY, VAPI_ASSISTANT_ID, VAPI_API_URL, N8N_WEBHOOK_URL
 
@@ -20,6 +21,74 @@ class ExotelVAPIBridge:
         self.vapi_api_key = VAPI_API_KEY
         self.vapi_assistant_id = VAPI_ASSISTANT_ID
         self.active_calls = {}  # Track active bridge connections
+
+    def convert_audio_format(self, mulaw_data: bytes) -> bytes:
+        """
+        Convert audio from Exotel format to VAPI format
+        Exotel: mulaw, 8kHz, mono
+        VAPI: linear16, 24kHz, stereo
+
+        Args:
+            mulaw_data: Raw mulaw audio from Exotel
+
+        Returns:
+            Converted linear16 PCM audio for VAPI
+        """
+        try:
+            # Step 1: Convert mulaw to linear PCM (16-bit)
+            linear_data = audioop.ulaw2lin(mulaw_data, 2)  # 2 = 16-bit samples
+
+            # Step 2: Resample from 8kHz to 24kHz (3x upsampling)
+            resampled_data, _ = audioop.ratecv(
+                linear_data,  # Input audio
+                2,            # Sample width (2 bytes = 16 bits)
+                1,            # Input channels (mono)
+                8000,         # Input sample rate
+                24000,        # Output sample rate
+                None          # State (None for first call)
+            )
+
+            # Step 3: Convert mono to stereo (duplicate channel)
+            stereo_data = audioop.tostereo(resampled_data, 2, 1, 1)  # (data, width, left_factor, right_factor)
+
+            return stereo_data
+        except Exception as e:
+            logger.error(f"Error converting audio format: {e}", exc_info=True)
+            return b''  # Return empty bytes on error
+
+    def convert_audio_format_reverse(self, linear_data: bytes) -> bytes:
+        """
+        Convert audio from VAPI format to Exotel format
+        VAPI: linear16, 24kHz, stereo
+        Exotel: mulaw, 8kHz, mono
+
+        Args:
+            linear_data: Raw linear16 PCM audio from VAPI
+
+        Returns:
+            Converted mulaw audio for Exotel
+        """
+        try:
+            # Step 1: Convert stereo to mono (mix down)
+            mono_data = audioop.tomono(linear_data, 2, 0.5, 0.5)  # (data, width, left_factor, right_factor)
+
+            # Step 2: Resample from 24kHz to 8kHz (downsample by 3x)
+            resampled_data, _ = audioop.ratecv(
+                mono_data,    # Input audio
+                2,            # Sample width (2 bytes = 16 bits)
+                1,            # Input channels (mono)
+                24000,        # Input sample rate
+                8000,         # Output sample rate
+                None          # State (None for first call)
+            )
+
+            # Step 3: Convert linear PCM to mulaw
+            mulaw_data = audioop.lin2ulaw(resampled_data, 2)  # 2 = 16-bit samples
+
+            return mulaw_data
+        except Exception as e:
+            logger.error(f"Error converting audio format (reverse): {e}", exc_info=True)
+            return b''  # Return empty bytes on error
 
     async def create_vapi_call(self, call_metadata: dict) -> str:
         """
@@ -91,28 +160,30 @@ class ExotelVAPIBridge:
                         msg_data = json.loads(message)
                         event_type = msg_data.get("event")
 
-                        # Enhanced logging: Log ALL message structures
-                        logger.info(f"📥 Exotel message: event={event_type}, keys={list(msg_data.keys())}")
-
                         if event_type == "media":
-                            # Log full media structure for debugging
-                            logger.info(f"🎵 Media event structure: {json.dumps(msg_data, indent=2)[:500]}")
-
                             # Extract and decode audio payload
                             media_payload = msg_data.get("media", {}).get("payload")
                             if media_payload:
-                                # Decode base64 audio
-                                audio_data = base64.b64decode(media_payload)
-                                # Send raw binary to VAPI
-                                await vapi_ws.send(audio_data)
-                                media_count += 1
-                                logger.info(f"✅ Forwarded {len(audio_data)} bytes audio to VAPI (chunk #{media_count})")
+                                # Decode base64 audio (mulaw format from Exotel)
+                                mulaw_data = base64.b64decode(media_payload)
+
+                                # Convert audio format: mulaw 8kHz mono → linear16 24kHz stereo
+                                converted_audio = self.convert_audio_format(mulaw_data)
+
+                                if converted_audio:
+                                    # Send converted audio to VAPI
+                                    await vapi_ws.send(converted_audio)
+                                    media_count += 1
+                                    if media_count == 1:  # Log first chunk
+                                        logger.info(f"🎵 Started audio forwarding with format conversion (mulaw 8kHz mono → linear16 24kHz stereo)")
+                                    if media_count % 50 == 0:  # Log every 50th chunk to reduce noise
+                                        logger.info(f"✅ Forwarded {media_count} audio chunks ({len(mulaw_data)}B → {len(converted_audio)}B per chunk)")
                             else:
-                                logger.warning(f"⚠️  Media event has no payload! Full message: {msg_data}")
+                                logger.warning(f"⚠️  Media event has no payload!")
                         elif event_type == "connected":
-                            logger.info(f"Exotel control: connected - {msg_data}")
+                            logger.info(f"Exotel connected")
                         elif event_type == "start":
-                            logger.info(f"Exotel control: start - {msg_data}")
+                            logger.info(f"Exotel stream started - {msg_data.get('media_format', {})}")
                             # Send acknowledgment to Exotel to start media streaming
                             ack_message = {
                                 "event": "start",
@@ -125,7 +196,7 @@ class ExotelVAPIBridge:
                             logger.info(f"Exotel stream stopped. Total media chunks received: {media_count}")
                             break
                         else:
-                            logger.info(f"Exotel event: {event_type} - {msg_data}")
+                            logger.debug(f"Exotel event: {event_type}")
                     except json.JSONDecodeError:
                         logger.warning(f"Non-JSON message from Exotel: {message[:100]}")
                     except Exception as e:
@@ -154,22 +225,29 @@ class ExotelVAPIBridge:
 
                 # VAPI sends binary audio data
                 if isinstance(message, bytes):
-                    # Encode to base64 and wrap in Exotel format
-                    audio_base64 = base64.b64encode(message).decode('utf-8')
-                    exotel_message = {
-                        "event": "media",
-                        "stream_sid": "vapi_stream",
-                        "sequence_number": str(sequence_number),
-                        "media": {
-                            "chunk": str(sequence_number),
-                            "timestamp": str(sequence_number * 20),  # Approximate timestamp
-                            "payload": audio_base64
+                    # Convert audio format: linear16 24kHz stereo → mulaw 8kHz mono
+                    converted_audio = self.convert_audio_format_reverse(message)
+
+                    if converted_audio:
+                        # Encode to base64 and wrap in Exotel format
+                        audio_base64 = base64.b64encode(converted_audio).decode('utf-8')
+                        exotel_message = {
+                            "event": "media",
+                            "stream_sid": "vapi_stream",
+                            "sequence_number": str(sequence_number),
+                            "media": {
+                                "chunk": str(sequence_number),
+                                "timestamp": str(sequence_number * 20),  # Approximate timestamp
+                                "payload": audio_base64
+                            }
                         }
-                    }
-                    await exotel_ws.send(json.dumps(exotel_message))
-                    audio_count += 1
-                    logger.info(f"🔊 Forwarded {len(message)} bytes audio to Exotel (chunk #{audio_count})")
-                    sequence_number += 1
+                        await exotel_ws.send(json.dumps(exotel_message))
+                        audio_count += 1
+                        if audio_count == 1:  # Log first chunk
+                            logger.info(f"🔊 Started AI response with format conversion (linear16 24kHz stereo → mulaw 8kHz mono)")
+                        if audio_count % 50 == 0:  # Log every 50th chunk
+                            logger.info(f"🔊 Forwarded {audio_count} AI response chunks ({len(message)}B → {len(converted_audio)}B per chunk)")
+                        sequence_number += 1
 
                 # VAPI also sends text control messages
                 elif isinstance(message, str):
