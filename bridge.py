@@ -9,7 +9,7 @@ import logging
 import websockets
 import aiohttp
 import base64
-import audioop_lts as audioop  # audioop was removed in Python 3.13, use audioop-lts
+import pyaudioop as audioop  # audioop was removed in Python 3.13, use pyaudioop
 from typing import Optional
 from config import VAPI_API_KEY, VAPI_ASSISTANT_ID, VAPI_API_URL, N8N_WEBHOOK_URL
 
