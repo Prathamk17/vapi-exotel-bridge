@@ -9,11 +9,16 @@ import logging
 import websockets
 import aiohttp
 import base64
-import pyaudioop as audioop  # audioop was removed in Python 3.13, use pyaudioop
+import numpy as np
+from scipy import signal
 from typing import Optional
 from config import VAPI_API_KEY, VAPI_ASSISTANT_ID, VAPI_API_URL, N8N_WEBHOOK_URL
 
 logger = logging.getLogger(__name__)
+
+# μ-law compression constants
+MULAW_BIAS = 33
+MULAW_MAX = 0x1FFF  # 8191
 
 
 class ExotelVAPIBridge:
@@ -21,6 +26,41 @@ class ExotelVAPIBridge:
         self.vapi_api_key = VAPI_API_KEY
         self.vapi_assistant_id = VAPI_ASSISTANT_ID
         self.active_calls = {}  # Track active bridge connections
+
+    def mulaw_to_linear(self, mulaw_bytes: bytes) -> np.ndarray:
+        """Convert μ-law encoded audio to linear PCM"""
+        mulaw = np.frombuffer(mulaw_bytes, dtype=np.uint8)
+        # Invert the bits
+        mulaw = ~mulaw
+        # Extract sign, exponent, and mantissa
+        sign = (mulaw & 0x80) >> 7
+        exponent = (mulaw & 0x70) >> 4
+        mantissa = mulaw & 0x0F
+        # Compute linear value
+        linear = (mantissa << (exponent + 3)) + (1 << (exponent + 2)) - MULAW_BIAS
+        # Apply sign
+        linear = np.where(sign == 0, linear, -linear)
+        return linear.astype(np.int16)
+
+    def linear_to_mulaw(self, linear: np.ndarray) -> bytes:
+        """Convert linear PCM to μ-law encoded audio"""
+        # Normalize to 14-bit range
+        linear = np.clip(linear, -0x1FFF, 0x1FFF)
+        # Get sign
+        sign = (linear < 0).astype(np.uint8)
+        # Get absolute value
+        linear = np.abs(linear)
+        linear = linear + MULAW_BIAS
+        # Find exponent
+        exponent = np.zeros(len(linear), dtype=np.uint8)
+        for i in range(7, -1, -1):
+            mask = linear >= (1 << (i + 3))
+            exponent = np.where(mask & (exponent == 0), i, exponent)
+        # Get mantissa
+        mantissa = ((linear >> (exponent + 3)) & 0x0F).astype(np.uint8)
+        # Construct μ-law byte
+        mulaw = ~((sign << 7) | (exponent << 4) | mantissa)
+        return mulaw.astype(np.uint8).tobytes()
 
     def convert_audio_format(self, mulaw_data: bytes) -> bytes:
         """
@@ -36,22 +76,18 @@ class ExotelVAPIBridge:
         """
         try:
             # Step 1: Convert mulaw to linear PCM (16-bit)
-            linear_data = audioop.ulaw2lin(mulaw_data, 2)  # 2 = 16-bit samples
+            linear_audio = self.mulaw_to_linear(mulaw_data)
 
             # Step 2: Resample from 8kHz to 24kHz (3x upsampling)
-            resampled_data, _ = audioop.ratecv(
-                linear_data,  # Input audio
-                2,            # Sample width (2 bytes = 16 bits)
-                1,            # Input channels (mono)
-                8000,         # Input sample rate
-                24000,        # Output sample rate
-                None          # State (None for first call)
-            )
+            num_samples = int(len(linear_audio) * 24000 / 8000)
+            resampled_audio = signal.resample(linear_audio, num_samples)
+            resampled_audio = resampled_audio.astype(np.int16)
 
             # Step 3: Convert mono to stereo (duplicate channel)
-            stereo_data = audioop.tostereo(resampled_data, 2, 1, 1)  # (data, width, left_factor, right_factor)
+            stereo_audio = np.column_stack([resampled_audio, resampled_audio])
 
-            return stereo_data
+            # Convert to bytes (little-endian int16)
+            return stereo_audio.tobytes()
         except Exception as e:
             logger.error(f"Error converting audio format: {e}", exc_info=True)
             return b''  # Return empty bytes on error
@@ -69,21 +105,21 @@ class ExotelVAPIBridge:
             Converted mulaw audio for Exotel
         """
         try:
-            # Step 1: Convert stereo to mono (mix down)
-            mono_data = audioop.tomono(linear_data, 2, 0.5, 0.5)  # (data, width, left_factor, right_factor)
+            # Step 1: Convert bytes to numpy array (stereo, int16)
+            stereo_audio = np.frombuffer(linear_data, dtype=np.int16)
+            # Reshape to (n_samples, 2) for stereo
+            stereo_audio = stereo_audio.reshape(-1, 2)
 
-            # Step 2: Resample from 24kHz to 8kHz (downsample by 3x)
-            resampled_data, _ = audioop.ratecv(
-                mono_data,    # Input audio
-                2,            # Sample width (2 bytes = 16 bits)
-                1,            # Input channels (mono)
-                24000,        # Input sample rate
-                8000,         # Output sample rate
-                None          # State (None for first call)
-            )
+            # Step 2: Convert stereo to mono (average both channels)
+            mono_audio = stereo_audio.mean(axis=1).astype(np.int16)
 
-            # Step 3: Convert linear PCM to mulaw
-            mulaw_data = audioop.lin2ulaw(resampled_data, 2)  # 2 = 16-bit samples
+            # Step 3: Resample from 24kHz to 8kHz (downsample by 3x)
+            num_samples = int(len(mono_audio) * 8000 / 24000)
+            resampled_audio = signal.resample(mono_audio, num_samples)
+            resampled_audio = resampled_audio.astype(np.int16)
+
+            # Step 4: Convert linear PCM to mulaw
+            mulaw_data = self.linear_to_mulaw(resampled_audio)
 
             return mulaw_data
         except Exception as e:
