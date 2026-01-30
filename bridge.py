@@ -90,7 +90,7 @@ class ExotelVAPIBridge:
         """
         Convert audio from Exotel format to VAPI format
         Exotel: mulaw, 8kHz, mono
-        VAPI: linear16, 24kHz, stereo
+        VAPI: linear16, 16kHz, mono
 
         Args:
             mulaw_data: Raw mulaw audio from Exotel
@@ -102,14 +102,11 @@ class ExotelVAPIBridge:
             # Step 1: Convert mulaw to linear PCM (16-bit)
             linear_audio = self.mulaw_to_linear(mulaw_data)
 
-            # Step 2: Resample from 8kHz to 24kHz (3x upsampling)
-            resampled_audio = self.resample_audio(linear_audio, 8000, 24000)
+            # Step 2: Resample from 8kHz to 16kHz (2x upsampling)
+            resampled_audio = self.resample_audio(linear_audio, 8000, 16000)
 
-            # Step 3: Convert mono to stereo (duplicate channel)
-            stereo_audio = np.column_stack([resampled_audio, resampled_audio])
-
-            # Convert to bytes (little-endian int16)
-            return stereo_audio.tobytes()
+            # Convert to bytes (little-endian int16) - keep as mono
+            return resampled_audio.tobytes()
         except Exception as e:
             logger.error(f"Error converting audio format: {e}", exc_info=True)
             return b''  # Return empty bytes on error
@@ -117,7 +114,7 @@ class ExotelVAPIBridge:
     def convert_audio_format_reverse(self, linear_data: bytes) -> bytes:
         """
         Convert audio from VAPI format to Exotel format
-        VAPI: linear16, 24kHz, stereo
+        VAPI: linear16, 16kHz, mono
         Exotel: mulaw, 8kHz, mono
 
         Args:
@@ -127,18 +124,13 @@ class ExotelVAPIBridge:
             Converted mulaw audio for Exotel
         """
         try:
-            # Step 1: Convert bytes to numpy array (stereo, int16)
-            stereo_audio = np.frombuffer(linear_data, dtype=np.int16)
-            # Reshape to (n_samples, 2) for stereo
-            stereo_audio = stereo_audio.reshape(-1, 2)
+            # Step 1: Convert bytes to numpy array (mono, int16)
+            mono_audio = np.frombuffer(linear_data, dtype=np.int16)
 
-            # Step 2: Convert stereo to mono (average both channels)
-            mono_audio = stereo_audio.mean(axis=1).astype(np.int16)
+            # Step 2: Resample from 16kHz to 8kHz (downsample by 2x)
+            resampled_audio = self.resample_audio(mono_audio, 16000, 8000)
 
-            # Step 3: Resample from 24kHz to 8kHz (downsample by 3x)
-            resampled_audio = self.resample_audio(mono_audio, 24000, 8000)
-
-            # Step 4: Convert linear PCM to mulaw
+            # Step 3: Convert linear PCM to mulaw
             mulaw_data = self.linear_to_mulaw(resampled_audio)
 
             return mulaw_data
@@ -231,7 +223,7 @@ class ExotelVAPIBridge:
                                     await vapi_ws.send(converted_audio)
                                     media_count += 1
                                     if media_count == 1:  # Log first chunk
-                                        logger.info(f"🎵 Started audio forwarding with format conversion (mulaw 8kHz mono → linear16 24kHz stereo)")
+                                        logger.info(f"🎵 Started audio forwarding with format conversion (mulaw 8kHz mono → linear16 16kHz mono)")
                                     if media_count % 50 == 0:  # Log every 50th chunk to reduce noise
                                         logger.info(f"✅ Forwarded {media_count} audio chunks ({len(mulaw_data)}B → {len(converted_audio)}B per chunk)")
                             else:
@@ -300,7 +292,7 @@ class ExotelVAPIBridge:
                         await exotel_ws.send(json.dumps(exotel_message))
                         audio_count += 1
                         if audio_count == 1:  # Log first chunk
-                            logger.info(f"🔊 Started AI response with format conversion (linear16 24kHz stereo → mulaw 8kHz mono)")
+                            logger.info(f"🔊 Started AI response with format conversion (linear16 16kHz mono → mulaw 8kHz mono)")
                         if audio_count % 50 == 0:  # Log every 50th chunk
                             logger.info(f"🔊 Forwarded {audio_count} AI response chunks ({len(message)}B → {len(converted_audio)}B per chunk)")
                         sequence_number += 1
