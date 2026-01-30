@@ -53,7 +53,7 @@ class ExotelVAPIBridge:
 
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload) as response:
-                if response.status != 200:
+                if response.status not in (200, 201):
                     error_text = await response.text()
                     logger.error(f"Failed to create VAPI call: {response.status} - {error_text}")
                     raise Exception(f"VAPI API error: {response.status}")
