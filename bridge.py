@@ -10,7 +10,6 @@ import websockets
 import aiohttp
 import base64
 import numpy as np
-from scipy import signal
 from typing import Optional
 from config import VAPI_API_KEY, VAPI_ASSISTANT_ID, VAPI_API_URL, N8N_WEBHOOK_URL
 
@@ -26,6 +25,31 @@ class ExotelVAPIBridge:
         self.vapi_api_key = VAPI_API_KEY
         self.vapi_assistant_id = VAPI_ASSISTANT_ID
         self.active_calls = {}  # Track active bridge connections
+
+    def resample_audio(self, audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
+        """
+        Resample audio using linear interpolation
+
+        Args:
+            audio: Input audio samples
+            orig_rate: Original sample rate
+            target_rate: Target sample rate
+
+        Returns:
+            Resampled audio
+        """
+        # Calculate new length
+        duration = len(audio) / orig_rate
+        target_length = int(duration * target_rate)
+
+        # Create interpolation indices
+        orig_indices = np.arange(len(audio))
+        target_indices = np.linspace(0, len(audio) - 1, target_length)
+
+        # Perform linear interpolation
+        resampled = np.interp(target_indices, orig_indices, audio)
+
+        return resampled.astype(np.int16)
 
     def mulaw_to_linear(self, mulaw_bytes: bytes) -> np.ndarray:
         """Convert μ-law encoded audio to linear PCM"""
@@ -79,9 +103,7 @@ class ExotelVAPIBridge:
             linear_audio = self.mulaw_to_linear(mulaw_data)
 
             # Step 2: Resample from 8kHz to 24kHz (3x upsampling)
-            num_samples = int(len(linear_audio) * 24000 / 8000)
-            resampled_audio = signal.resample(linear_audio, num_samples)
-            resampled_audio = resampled_audio.astype(np.int16)
+            resampled_audio = self.resample_audio(linear_audio, 8000, 24000)
 
             # Step 3: Convert mono to stereo (duplicate channel)
             stereo_audio = np.column_stack([resampled_audio, resampled_audio])
@@ -114,9 +136,7 @@ class ExotelVAPIBridge:
             mono_audio = stereo_audio.mean(axis=1).astype(np.int16)
 
             # Step 3: Resample from 24kHz to 8kHz (downsample by 3x)
-            num_samples = int(len(mono_audio) * 8000 / 24000)
-            resampled_audio = signal.resample(mono_audio, num_samples)
-            resampled_audio = resampled_audio.astype(np.int16)
+            resampled_audio = self.resample_audio(mono_audio, 24000, 8000)
 
             # Step 4: Convert linear PCM to mulaw
             mulaw_data = self.linear_to_mulaw(resampled_audio)
