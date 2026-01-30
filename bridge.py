@@ -86,11 +86,11 @@ class ExotelVAPIBridge:
         mulaw = ~((sign << 7) | (exponent << 4) | mantissa)
         return mulaw.astype(np.uint8).tobytes()
 
-    def convert_audio_format(self, mulaw_data: bytes) -> bytes:
+    def convert_audio_format_24khz(self, mulaw_data: bytes) -> bytes:
         """
-        Convert audio from Exotel format to VAPI format
+        Convert audio from Exotel format to VAPI format (24kHz stereo)
         Exotel: mulaw, 8kHz, mono
-        VAPI: linear16, 16kHz, mono
+        VAPI: linear16, 24kHz, stereo
 
         Args:
             mulaw_data: Raw mulaw audio from Exotel
@@ -102,19 +102,32 @@ class ExotelVAPIBridge:
             # Step 1: Convert mulaw to linear PCM (16-bit)
             linear_audio = self.mulaw_to_linear(mulaw_data)
 
-            # Step 2: Resample from 8kHz to 16kHz (2x upsampling)
-            resampled_audio = self.resample_audio(linear_audio, 8000, 16000)
+            # Step 2: Resample from 8kHz to 24kHz (3x upsampling)
+            resampled_audio = self.resample_audio(linear_audio, 8000, 24000)
 
-            # Convert to bytes (little-endian int16) - keep as mono
+            # Step 3: Convert mono to stereo (duplicate channel)
+            stereo_audio = np.column_stack([resampled_audio, resampled_audio])
+
+            # Convert to bytes (little-endian int16)
+            return stereo_audio.tobytes()
+        except Exception as e:
+            logger.error(f"Error converting audio format: {e}", exc_info=True)
+            return b''  # Return empty bytes on error
+
+    def convert_audio_format(self, mulaw_data: bytes) -> bytes:
+        """Legacy 16kHz conversion - kept for compatibility"""
+        try:
+            linear_audio = self.mulaw_to_linear(mulaw_data)
+            resampled_audio = self.resample_audio(linear_audio, 8000, 16000)
             return resampled_audio.tobytes()
         except Exception as e:
             logger.error(f"Error converting audio format: {e}", exc_info=True)
             return b''  # Return empty bytes on error
 
-    def convert_audio_format_reverse(self, linear_data: bytes) -> bytes:
+    def convert_audio_format_reverse_24khz(self, linear_data: bytes) -> bytes:
         """
-        Convert audio from VAPI format to Exotel format
-        VAPI: linear16, 16kHz, mono
+        Convert audio from VAPI format to Exotel format (24kHz stereo)
+        VAPI: linear16, 24kHz, stereo
         Exotel: mulaw, 8kHz, mono
 
         Args:
@@ -124,15 +137,30 @@ class ExotelVAPIBridge:
             Converted mulaw audio for Exotel
         """
         try:
-            # Step 1: Convert bytes to numpy array (mono, int16)
-            mono_audio = np.frombuffer(linear_data, dtype=np.int16)
+            # Step 1: Convert bytes to numpy array (stereo, int16)
+            stereo_audio = np.frombuffer(linear_data, dtype=np.int16)
+            stereo_audio = stereo_audio.reshape(-1, 2)
 
-            # Step 2: Resample from 16kHz to 8kHz (downsample by 2x)
-            resampled_audio = self.resample_audio(mono_audio, 16000, 8000)
+            # Step 2: Convert stereo to mono (average both channels)
+            mono_audio = stereo_audio.mean(axis=1).astype(np.int16)
 
-            # Step 3: Convert linear PCM to mulaw
+            # Step 3: Resample from 24kHz to 8kHz (downsample by 3x)
+            resampled_audio = self.resample_audio(mono_audio, 24000, 8000)
+
+            # Step 4: Convert linear PCM to mulaw
             mulaw_data = self.linear_to_mulaw(resampled_audio)
 
+            return mulaw_data
+        except Exception as e:
+            logger.error(f"Error converting audio format (reverse): {e}", exc_info=True)
+            return b''  # Return empty bytes on error
+
+    def convert_audio_format_reverse(self, linear_data: bytes) -> bytes:
+        """Legacy 16kHz conversion - kept for compatibility"""
+        try:
+            mono_audio = np.frombuffer(linear_data, dtype=np.int16)
+            resampled_audio = self.resample_audio(mono_audio, 16000, 8000)
+            mulaw_data = self.linear_to_mulaw(resampled_audio)
             return mulaw_data
         except Exception as e:
             logger.error(f"Error converting audio format (reverse): {e}", exc_info=True)
@@ -156,14 +184,6 @@ class ExotelVAPIBridge:
 
         payload = {
             "assistantId": self.vapi_assistant_id,
-            "transport": {
-                "provider": "vapi.websocket",
-                "audioFormat": {
-                    "format": "mulaw",
-                    "container": "raw",
-                    "sampleRate": 8000
-                }
-            },
             "assistantOverrides": {
                 "variableValues": {
                     "lead_name": call_metadata.get("lead_name", "Customer"),
@@ -223,14 +243,17 @@ class ExotelVAPIBridge:
                                 # Decode base64 audio (mulaw format from Exotel)
                                 mulaw_data = base64.b64decode(media_payload)
 
-                                # TEST: Send raw mulaw directly to VAPI (no conversion)
-                                # VAPI configured to accept mulaw 8kHz format
-                                await vapi_ws.send(mulaw_data)
-                                media_count += 1
-                                if media_count == 1:  # Log first chunk
-                                    logger.info(f"🎵 Started audio forwarding (RAW mulaw 8kHz - no conversion)")
-                                if media_count % 50 == 0:  # Log every 50th chunk to reduce noise
-                                    logger.info(f"✅ Forwarded {media_count} audio chunks ({len(mulaw_data)}B raw mulaw)")
+                                # Convert to format VAPI expects (from control message)
+                                # VAPI wants: linear16, 24kHz, stereo
+                                converted_audio = self.convert_audio_format_24khz(mulaw_data)
+
+                                if converted_audio:
+                                    await vapi_ws.send(converted_audio)
+                                    media_count += 1
+                                    if media_count == 1:  # Log first chunk
+                                        logger.info(f"🎵 Started audio forwarding (mulaw 8kHz → linear16 24kHz stereo)")
+                                    if media_count % 50 == 0:  # Log every 50th chunk to reduce noise
+                                        logger.info(f"✅ Forwarded {media_count} audio chunks ({len(mulaw_data)}B → {len(converted_audio)}B)")
                             else:
                                 logger.warning(f"⚠️  Media event has no payload!")
                         elif event_type == "connected":
@@ -278,33 +301,38 @@ class ExotelVAPIBridge:
 
                 # VAPI sends binary audio data
                 if isinstance(message, bytes):
-                    # TEST: VAPI sends mulaw directly (no conversion needed)
-                    # Encode to base64 and wrap in Exotel format
-                    audio_base64 = base64.b64encode(message).decode('utf-8')
-                    exotel_message = {
-                        "event": "media",
-                        "stream_sid": "vapi_stream",
-                        "sequence_number": str(sequence_number),
-                        "media": {
-                            "chunk": str(sequence_number),
-                            "timestamp": str(sequence_number * 20),  # Approximate timestamp
-                            "payload": audio_base64
+                    # Convert from VAPI format (linear16 24kHz stereo) to Exotel (mulaw 8kHz mono)
+                    converted_audio = self.convert_audio_format_reverse_24khz(message)
+
+                    if converted_audio:
+                        audio_base64 = base64.b64encode(converted_audio).decode('utf-8')
+                        exotel_message = {
+                            "event": "media",
+                            "stream_sid": "vapi_stream",
+                            "sequence_number": str(sequence_number),
+                            "media": {
+                                "chunk": str(sequence_number),
+                                "timestamp": str(sequence_number * 20),  # Approximate timestamp
+                                "payload": audio_base64
+                            }
                         }
-                    }
-                    await exotel_ws.send(json.dumps(exotel_message))
-                    audio_count += 1
-                    if audio_count == 1:  # Log first chunk
-                        logger.info(f"🔊 Started AI response (RAW mulaw 8kHz - no conversion)")
-                    if audio_count % 50 == 0:  # Log every 50th chunk
-                        logger.info(f"🔊 Forwarded {audio_count} AI response chunks ({len(message)}B raw mulaw)")
-                    sequence_number += 1
+                        await exotel_ws.send(json.dumps(exotel_message))
+                        audio_count += 1
+                        if audio_count == 1:  # Log first chunk
+                            logger.info(f"🔊 Started AI response (linear16 24kHz stereo → mulaw 8kHz mono)")
+                        if audio_count % 50 == 0:  # Log every 50th chunk
+                            logger.info(f"🔊 Forwarded {audio_count} AI response chunks ({len(message)}B → {len(converted_audio)}B)")
+                        sequence_number += 1
 
                 # VAPI also sends text control messages
                 elif isinstance(message, str):
                     try:
                         msg_data = json.loads(message)
                         logger.info(f"📨 VAPI control message: {msg_data}")
-                        # Could translate VAPI control messages to Exotel format if needed
+
+                        # Acknowledge VAPI's start message
+                        if msg_data.get('type') == 'start':
+                            logger.info(f"VAPI expects: {msg_data.get('encoding')} at {msg_data.get('sampleRate')}Hz, {msg_data.get('channels')} channels")
                     except json.JSONDecodeError:
                         logger.warning(f"Non-JSON text from VAPI: {message[:100]}")
 
