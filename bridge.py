@@ -1,12 +1,14 @@
 """
 WebSocket Bridge: Exotel ↔ VAPI
 Forwards audio bidirectionally between Exotel's Voicebot and VAPI AI
+Handles protocol translation between Exotel's JSON/base64 format and VAPI's raw binary format
 """
 import asyncio
 import json
 import logging
 import websockets
 import aiohttp
+import base64
 from typing import Optional
 from config import VAPI_API_KEY, VAPI_ASSISTANT_ID, VAPI_API_URL, N8N_WEBHOOK_URL
 
@@ -70,41 +72,96 @@ class ExotelVAPIBridge:
 
                 return listen_url, data.get("id")
 
-    async def forward_audio(self, source_ws, dest_ws, direction: str):
+    async def forward_exotel_to_vapi(self, exotel_ws, vapi_ws):
         """
-        Forward audio/messages from source WebSocket to destination WebSocket
-
-        Args:
-            source_ws: Source WebSocket
-            dest_ws: Destination WebSocket
-            direction: "exotel_to_vapi" or "vapi_to_exotel"
+        Forward audio from Exotel to VAPI with protocol translation
+        Exotel sends: JSON messages with base64-encoded audio
+        VAPI expects: Raw binary PCM audio
         """
         try:
-            async for message in source_ws:
-                if dest_ws.open:
-                    # Check if message is text (control message) or binary (audio)
-                    if isinstance(message, bytes):
-                        # Binary audio data - forward as-is
-                        await dest_ws.send(message)
-                        logger.debug(f"Forwarded {len(message)} bytes {direction}")
-                    else:
-                        # Text message (JSON control messages)
-                        try:
-                            msg_data = json.loads(message)
-                            logger.info(f"{direction} control message: {msg_data}")
-
-                            # Forward control messages
-                            await dest_ws.send(message)
-                        except json.JSONDecodeError:
-                            # Not JSON, forward as-is
-                            await dest_ws.send(message)
-                else:
-                    logger.warning(f"Destination WebSocket closed, stopping {direction} forward")
+            async for message in exotel_ws:
+                if not vapi_ws.open:
+                    logger.warning("VAPI WebSocket closed, stopping exotel_to_vapi forward")
                     break
+
+                # Exotel sends text messages with JSON
+                if isinstance(message, str):
+                    try:
+                        msg_data = json.loads(message)
+                        event_type = msg_data.get("event")
+
+                        if event_type == "media":
+                            # Extract and decode audio payload
+                            media_payload = msg_data.get("media", {}).get("payload")
+                            if media_payload:
+                                # Decode base64 audio
+                                audio_data = base64.b64decode(media_payload)
+                                # Send raw binary to VAPI
+                                await vapi_ws.send(audio_data)
+                                logger.debug(f"Forwarded {len(audio_data)} bytes audio to VAPI")
+                        elif event_type in ["connected", "start"]:
+                            logger.info(f"Exotel control: {event_type}")
+                        elif event_type == "stop":
+                            logger.info("Exotel stream stopped")
+                            break
+                        else:
+                            logger.debug(f"Exotel event: {event_type}")
+                    except json.JSONDecodeError:
+                        logger.warning(f"Non-JSON message from Exotel: {message[:100]}")
+                    except Exception as e:
+                        logger.error(f"Error processing Exotel message: {e}")
+                else:
+                    logger.warning(f"Unexpected binary message from Exotel")
+
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"WebSocket connection closed: {direction}")
+            logger.info("Exotel WebSocket connection closed")
         except Exception as e:
-            logger.error(f"Error forwarding {direction}: {e}")
+            logger.error(f"Error in exotel_to_vapi forward: {e}", exc_info=True)
+
+    async def forward_vapi_to_exotel(self, vapi_ws, exotel_ws):
+        """
+        Forward audio from VAPI to Exotel with protocol translation
+        VAPI sends: Raw binary PCM audio
+        Exotel expects: JSON messages with base64-encoded audio
+        """
+        sequence_number = 1
+        try:
+            async for message in vapi_ws:
+                if not exotel_ws.open:
+                    logger.warning("Exotel WebSocket closed, stopping vapi_to_exotel forward")
+                    break
+
+                # VAPI sends binary audio data
+                if isinstance(message, bytes):
+                    # Encode to base64 and wrap in Exotel format
+                    audio_base64 = base64.b64encode(message).decode('utf-8')
+                    exotel_message = {
+                        "event": "media",
+                        "stream_sid": "vapi_stream",
+                        "sequence_number": str(sequence_number),
+                        "media": {
+                            "chunk": str(sequence_number),
+                            "timestamp": str(sequence_number * 20),  # Approximate timestamp
+                            "payload": audio_base64
+                        }
+                    }
+                    await exotel_ws.send(json.dumps(exotel_message))
+                    logger.debug(f"Forwarded {len(message)} bytes audio to Exotel")
+                    sequence_number += 1
+
+                # VAPI also sends text control messages
+                elif isinstance(message, str):
+                    try:
+                        msg_data = json.loads(message)
+                        logger.info(f"VAPI control message: {msg_data}")
+                        # Could translate VAPI control messages to Exotel format if needed
+                    except json.JSONDecodeError:
+                        logger.warning(f"Non-JSON text from VAPI: {message[:100]}")
+
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("VAPI WebSocket connection closed")
+        except Exception as e:
+            logger.error(f"Error in vapi_to_exotel forward: {e}", exc_info=True)
 
     async def send_call_results(self, call_id: str, results: dict):
         """
@@ -165,11 +222,11 @@ class ExotelVAPIBridge:
                 "start_time": asyncio.get_event_loop().time()
             }
 
-            # Step 3: Forward audio bidirectionally
-            logger.info("Starting bidirectional audio forwarding...")
+            # Step 3: Forward audio bidirectionally with protocol translation
+            logger.info("Starting bidirectional audio forwarding with protocol translation...")
             await asyncio.gather(
-                self.forward_audio(exotel_ws, vapi_ws, "exotel_to_vapi"),
-                self.forward_audio(vapi_ws, exotel_ws, "vapi_to_exotel")
+                self.forward_exotel_to_vapi(exotel_ws, vapi_ws),
+                self.forward_vapi_to_exotel(vapi_ws, exotel_ws)
             )
 
         except Exception as e:
